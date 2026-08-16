@@ -1,14 +1,16 @@
 -- Enemy HP Ruler - an Ironmon Tracker extension for Pokemon FireRed/LeafGreen
 -- Draws a ruler (tick marks) over the enemy's HP bar during battle, so you can
 -- easily estimate what percentage of HP the enemy has remaining.
--- This is purely a visual overlay; it does NOT read the enemy's HP from memory.
+-- The ruler itself is purely visual and displays no HP values. The optional
+-- "last damage" feature (off by default) compares enemy HP between updates to
+-- paint the most recent chunk of damage red, but never shows numbers.
 --
 -- Install: place this file in the Tracker's "extensions" folder, then enable it
 -- from the Tracker UI: Settings (gear) -> Extensions -> Enemy HP Ruler
 
 local function IronmonHpRuler()
 	local self = {}
-	self.version = "1.1"
+	self.version = "1.5"
 	self.name = "HP Ruler"
 	self.author = "WaffleSmacker"
 	self.description = "For those of you who can't eyeball the HP like me.  Uhh.. follow WaffleSmacker I guess?"
@@ -37,6 +39,9 @@ local function IronmonHpRuler()
 		-- false: numbers read 25 50 75 left-to-right (HP remaining)
 		-- true: numbers read 75 50 25 left-to-right (damage dealt)
 		reverseNumbers = false,
+		-- Paint the most recent chunk of damage on the bar in red (off by default).
+		-- Clears when the enemy's HP next changes, they switch out, or the battle ends.
+		showLastDamage = false,
 		-- Colors are 0xAARRGGBB (AA = opacity, FF = solid)
 		tickColor = 0xFF000000, -- solid black
 		quarterLineColor = 0x98000000, -- semi-transparent black
@@ -44,6 +49,10 @@ local function IronmonHpRuler()
 		labelBackColor = 0x00000000, -- transparent (the box below provides the backing)
 		labelBoxBorderColor = 0xFF000000, -- black outline
 		labelBoxFillColor = 0xFFF8F8D8, -- cream, matches the healthbox color
+		lastDamageColor = 0xFFFF4040, -- red segment for the most recent damage
+		-- Used instead when the enemy is below 20% HP (their bar fill is red there,
+		-- so a red segment would blend right into it)
+		lastDamageLowHpColor = 0xFF303030,
 		-- If the ruler ever looks misaligned, nudge it here (in game pixels)
 		nudgeX = 0,
 		nudgeY = 0,
@@ -59,14 +68,17 @@ local function IronmonHpRuler()
 		reverseNumbers = false,
 		showQuarterLabels = true,
 		showLabelBoxes = true,
+		showLastDamage = false,
 		tickColor = 0xFF000000,
 		quarterLineColor = 0x98000000,
 		labelColor = 0xFF000000,
 		labelBoxBorderColor = 0xFF000000,
 		labelBoxFillColor = 0xFFF8F8D8,
+		lastDamageColor = 0xFFFF4040,
+		lastDamageLowHpColor = 0xFF303030,
 	}
-	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor" }
-	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes" }
+	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor", "lastDamageColor", "lastDamageLowHpColor" }
+	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes", "showLastDamage" }
 
 	------------------------------------------------------------------
 	-- Enemy HP bar geometry for FRLG (from the pokefirered decomp,
@@ -134,12 +146,81 @@ local function IronmonHpRuler()
 	-- Show/hide helpers
 	------------------------------------------------------------------
 
-	-- Returns true if the enemy mon in that battle slot is out and conscious;
-	-- used only to show/hide the ruler (e.g. hide it after a faint until the next mon is sent out)
-	local function enemySlotHasLivingMon(slotKey)
-		local partySlot = Battle.Combatants and Battle.Combatants[slotKey]
-		local pokemon = Tracker.getPokemon(partySlot or 1, false)
-		return pokemon ~= nil and (pokemon.curHP or 0) > 0
+	-- The game stores its active screen-function pointer in gMain.callback2.
+	-- While the battle UI (with the healthboxes) is on screen it points at
+	-- BattleMainCB2; the in-battle bag, party, and summary screens set their own.
+	-- Addresses from the pret decomp symbol files, same for FireRed & LeafGreen (U):
+	local GMAIN_CALLBACK2_ADDR = 0x030030F4 -- gMain (0x030030F0) + 4
+	local BATTLE_MAIN_CB2 = {
+		[0x08011100] = true, -- v1.0
+		[0x08011114] = true, -- v1.1
+	}
+
+	-- Returns false while a sub-screen (bag, party, summary) covers the battle UI
+	local function isBattleScreenShowing()
+		local gameName = GameSettings.gamename or ""
+		if gameName ~= "Pokemon FireRed (U)" and gameName ~= "Pokemon LeafGreen (U)" then
+			return true -- unknown addresses for this version; never hide the ruler
+		end
+		local callback2 = Memory.readdword(GMAIN_CALLBACK2_ADDR)
+		callback2 = callback2 - (callback2 % 2) -- clear the THUMB bit from the pointer
+		return BATTLE_MAIN_CB2[callback2] == true
+	end
+
+	-- Live in-battle HP comes from the game's gBattleMons battle structs (the
+	-- party structs don't reliably sync mid-battle in gen 3).
+	-- Battler order: 0 = player left, 1 = enemy left, 2 = player right, 3 = enemy right
+	local BATTLER_INDEX = { LeftOther = 1, RightOther = 3 }
+	local BATTLEMON_HP_OFFSET = 0x28
+	local BATTLEMON_MAXHP_OFFSET = 0x2C
+
+	-- Returns curHP, maxHP for the enemy in that battle slot, or nil if no valid mon is out
+	local function readEnemyBattleHP(slotKey)
+		local baseAddress = GameSettings.gBattleMons or 0
+		if baseAddress == 0 then return nil end
+		local monAddress = baseAddress + BATTLER_INDEX[slotKey] * Program.Addresses.sizeofBattlePokemon
+		local species = Memory.readword(monAddress)
+		local maxHP = Memory.readword(monAddress + BATTLEMON_MAXHP_OFFSET)
+		if species == 0 or maxHP == 0 then return nil end
+		return Memory.readword(monAddress + BATTLEMON_HP_OFFSET), maxHP
+	end
+
+	------------------------------------------------------------------
+	-- "Last damage" tracking: remembers each enemy slot's HP fraction and,
+	-- when it drops, records the lost chunk as a segment to paint red.
+	-- [slotKey] = { lastFrac, seg = {low, high}, lastDropFrame }
+	------------------------------------------------------------------
+	local damageState = {}
+
+	local function updateDamageState(slotKey, curHP, maxHP)
+		if not Settings.showLastDamage then
+			damageState[slotKey] = nil -- keep no stale segments while the feature is off
+			return
+		end
+		if curHP == nil or maxHP == nil or maxHP <= 0 then
+			damageState[slotKey] = nil
+			return
+		end
+		local hpFrac = math.max(0, math.min(1, curHP / maxHP))
+		local state = damageState[slotKey]
+		if state == nil then
+			damageState[slotKey] = { lastFrac = hpFrac }
+			return
+		end
+		if hpFrac < state.lastFrac then
+			local currentFrame = emu.framecount()
+			-- Merge drops landing in quick succession (multi-hit moves) into one segment
+			local MERGE_WINDOW_FRAMES = 90
+			if state.seg ~= nil and state.lastDropFrame ~= nil and (currentFrame - state.lastDropFrame) <= MERGE_WINDOW_FRAMES then
+				state.seg.low = hpFrac
+			else
+				state.seg = { low = hpFrac, high = state.lastFrac }
+			end
+			state.lastDropFrame = currentFrame
+		elseif hpFrac > state.lastFrac then
+			state.seg = nil -- they healed; the old damage chunk is no longer meaningful
+		end
+		state.lastFrac = hpFrac
 	end
 
 	-- Appear-delay tracking: [slotKey] = earliest frame the ruler may show
@@ -153,6 +234,7 @@ local function IronmonHpRuler()
 		for _, slotKey in ipairs({ "LeftOther", "RightOther" }) do
 			showAtFrame[slotKey] = emu.framecount() + delay
 			lastOccupant[slotKey] = Battle.Combatants and Battle.Combatants[slotKey]
+			damageState[slotKey] = nil
 		end
 	end
 
@@ -164,6 +246,7 @@ local function IronmonHpRuler()
 		if occupant ~= lastOccupant[slotKey] then
 			lastOccupant[slotKey] = occupant
 			showAtFrame[slotKey] = currentFrame + Settings.appearDelaySwitchIn
+			damageState[slotKey] = nil -- a different mon is out; forget the old segment
 		end
 		local showAt = showAtFrame[slotKey] or 0
 		-- Safety: if the frame counter reset (e.g. loadstate/new seed), don't stay hidden forever
@@ -177,9 +260,23 @@ local function IronmonHpRuler()
 	------------------------------------------------------------------
 	-- Drawing
 	------------------------------------------------------------------
-	local function drawRuler(barX, barY)
+	local function drawRuler(barX, barY, slotKey)
 		barX = barX + Settings.nudgeX
 		barY = barY + Settings.nudgeY
+		-- Red segment for the most recent damage, drawn first so ruler marks stay on top
+		local damageSeg = Settings.showLastDamage and damageState[slotKey] and damageState[slotKey].seg or nil
+		if damageSeg ~= nil and damageSeg.high > damageSeg.low then
+			-- Below 20% HP the game's bar fill is red, so use the contrast color there
+			local segColor = Settings.lastDamageColor
+			if (damageState[slotKey].lastFrac or 1) <= 0.20 then
+				segColor = Settings.lastDamageLowHpColor
+			end
+			local x1 = barX + math.floor(BAR_WIDTH * damageSeg.low + 0.5)
+			local x2 = barX + math.floor(BAR_WIDTH * damageSeg.high + 0.5)
+			if x2 > x1 then
+				gui.drawRectangle(x1, barY, x2 - x1 - 1, BAR_HEIGHT - 1, segColor, segColor)
+			end
+		end
 		if Settings.showTicks then
 			for i = 0, 10 do
 				-- Tick sits at the boundary the fill edge reaches at (i*10)% HP
@@ -230,12 +327,13 @@ local function IronmonHpRuler()
 	function self.configureOptions()
 		if not Main.IsOnBizhawk() then return end
 		closeOptionsForm()
-		optionsForm = forms.newform(360, 380, "HP Ruler Options", function() optionsForm = nil end)
+		optionsForm = forms.newform(360, 440, "HP Ruler Options", function() optionsForm = nil end)
 
 		local checkboxRows = {
 			{ key = "showQuarterLabels", label = "Show numbers below the bar" },
 			{ key = "showLabelBoxes", label = "Show boxes behind the numbers" },
 			{ key = "reverseNumbers", label = "Reverse numbers: show 75 50 25 (damage dealt)" },
+			{ key = "showLastDamage", label = "Paint the last damage taken red on the bar" },
 		}
 		local checkboxes = {}
 		local rowY = 10
@@ -252,6 +350,8 @@ local function IronmonHpRuler()
 			{ key = "labelColor", label = "Numbers" },
 			{ key = "labelBoxBorderColor", label = "Number box border" },
 			{ key = "labelBoxFillColor", label = "Number box fill" },
+			{ key = "lastDamageColor", label = "Last damage segment" },
+			{ key = "lastDamageLowHpColor", label = "Last damage (enemy hp in red)" },
 		}
 		local colorTextboxes = {}
 		rowY = rowY + 10
@@ -331,11 +431,15 @@ local function IronmonHpRuler()
 
 		if not inBattle then return end
 		if Program.currentOverlay ~= nil then return end -- e.g. log viewer is open
+		if not isBattleScreenShowing() then return end -- e.g. in-battle bag or party menu is open
 
 		local positions = (Battle.numBattlers == 4) and BarPositions.doubles or BarPositions.singles
 		for _, pos in ipairs(positions) do
-			if slotDelayElapsed(pos.slotKey) and enemySlotHasLivingMon(pos.slotKey) then
-				drawRuler(pos.x, pos.y)
+			local curHP, maxHP = readEnemyBattleHP(pos.slotKey)
+			local delayElapsed = slotDelayElapsed(pos.slotKey) -- also detects switch-ins; call before damage tracking
+			updateDamageState(pos.slotKey, curHP, maxHP)
+			if delayElapsed and curHP ~= nil and curHP > 0 then
+				drawRuler(pos.x, pos.y, pos.slotKey)
 			end
 		end
 	end
