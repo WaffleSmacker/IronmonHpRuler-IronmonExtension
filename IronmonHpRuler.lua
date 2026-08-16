@@ -10,7 +10,7 @@
 
 local function IronmonHpRuler()
 	local self = {}
-	self.version = "1.6"
+	self.version = "1.61"
 	self.name = "HP Ruler"
 	self.author = "WaffleSmacker"
 	self.description = "For those of you who can't eyeball the HP like me.  Uhh.. follow WaffleSmacker I guess?"
@@ -55,7 +55,7 @@ local function IronmonHpRuler()
 		lastDamageColor = 0xFFFF4040, -- red segment for the most recent damage
 		-- Used instead when the enemy is below 20% HP (their bar fill is red there,
 		-- so a red segment would blend right into it)
-		lastDamageLowHpColor = 0xFF3060F8, -- blue
+		lastDamageLowHpColor = 0xFF82CAFF, -- light blue
 		-- If the ruler ever looks misaligned, nudge it here (in game pixels)
 		nudgeX = 0,
 		nudgeY = 0,
@@ -79,7 +79,7 @@ local function IronmonHpRuler()
 		labelBoxBorderColor = 0xFF000000,
 		labelBoxFillColor = 0xFFF8F8D8,
 		lastDamageColor = 0xFFFF4040,
-		lastDamageLowHpColor = 0xFF3060F8,
+		lastDamageLowHpColor = 0xFF82CAFF,
 	}
 	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor", "lastDamageColor", "lastDamageLowHpColor" }
 	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes", "showLastDamage", "quarterLinesBelowBar" }
@@ -104,8 +104,14 @@ local function IronmonHpRuler()
 	}
 
 	------------------------------------------------------------------
-	-- Settings persistence (stored in the Tracker's Settings.ini)
+	-- Settings persistence: saved to this extension's OWN file in the
+	-- extensions folder (IronmonHpRuler-Settings.json); the Tracker's
+	-- Settings.ini is never written to.
 	------------------------------------------------------------------
+	local function getSettingsFilePath()
+		return FileManager.getExtensionsFolderPath() .. "IronmonHpRuler-Settings.json"
+	end
+
 	local function colorToHex(colorNumber)
 		-- avoids string.format("%08X") which can error on older Lua versions for values > 2^31
 		return string.format("%04X%04X", math.floor(colorNumber / 65536) % 65536, colorNumber % 65536)
@@ -123,27 +129,32 @@ local function IronmonHpRuler()
 	end
 
 	local function loadSavedSettings()
+		local savedData = FileManager.decodeJsonFile(getSettingsFilePath())
+		if type(savedData) ~= "table" then
+			return -- no settings file yet; keep the defaults above
+		end
 		for _, key in ipairs(BoolKeys) do
-			local savedValue = TrackerAPI.getExtensionSetting(EXT_KEY, key)
-			if savedValue ~= nil then
-				Settings[key] = (savedValue == true or savedValue == "true")
+			if type(savedData[key]) == "boolean" then
+				Settings[key] = savedData[key]
 			end
 		end
 		for _, key in ipairs(ColorKeys) do
-			local savedValue = tonumber(TrackerAPI.getExtensionSetting(EXT_KEY, key) or "")
-			if savedValue ~= nil and savedValue >= 0 and savedValue <= 0xFFFFFFFF then
-				Settings[key] = savedValue
+			local colorNumber = parseColorHex(savedData[key])
+			if colorNumber ~= nil then
+				Settings[key] = colorNumber
 			end
 		end
 	end
 
 	local function saveSettings()
+		local dataToSave = {}
 		for _, key in ipairs(BoolKeys) do
-			TrackerAPI.saveExtensionSetting(EXT_KEY, key, Settings[key] == true)
+			dataToSave[key] = (Settings[key] == true)
 		end
 		for _, key in ipairs(ColorKeys) do
-			TrackerAPI.saveExtensionSetting(EXT_KEY, key, Settings[key])
+			dataToSave[key] = colorToHex(Settings[key]) -- hex strings, easy to hand-edit
 		end
+		FileManager.encodeToJsonFile(getSettingsFilePath(), dataToSave)
 	end
 
 	------------------------------------------------------------------
