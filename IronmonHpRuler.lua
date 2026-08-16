@@ -6,9 +6,9 @@
 -- Install: place this file in the Tracker's "extensions" folder, then enable it
 -- from the Tracker UI: Settings (gear) -> Extensions -> Enemy HP Ruler
 
-local function EnemyHPRuler()
+local function IronmonHpRuler()
 	local self = {}
-	self.version = "1.0"
+	self.version = "1.1"
 	self.name = "HP Ruler"
 	self.author = "WaffleSmacker"
 	self.description = "For those of you who can't eyeball the HP like me.  Uhh.. follow WaffleSmacker I guess?"
@@ -16,7 +16,7 @@ local function EnemyHPRuler()
 	self.url = string.format("https://github.com/%s", self.github)
 
 	-- Must match this file's name; used for saving settings and auto-updating
-	local EXT_KEY = "EnemyHPRuler"
+	local EXT_KEY = "IronmonHpRuler"
 
 	------------------------------------------------------------------
 	-- SETTINGS
@@ -50,13 +50,15 @@ local function EnemyHPRuler()
 		-- Delays (in frames, 60 = 1 second) before the ruler appears, so it
 		-- doesn't show up while the healthbox is still animating in
 		appearDelayTrainerStart = 150, -- battle start vs a trainer (send-out animation)
-		appearDelayWildStart = 70, -- battle start vs a wild pokemon
+		appearDelayWildStart = 160, -- battle start vs a wild pokemon
 		appearDelaySwitchIn = 48, -- a new enemy pokemon switches/is sent in mid-battle
 	}
 
 	-- The options screen can save/reset these; keep defaults for the "Defaults" button
 	local ConfigurableDefaults = {
 		reverseNumbers = false,
+		showQuarterLabels = true,
+		showLabelBoxes = true,
 		tickColor = 0xFF000000,
 		quarterLineColor = 0x98000000,
 		labelColor = 0xFF000000,
@@ -64,6 +66,7 @@ local function EnemyHPRuler()
 		labelBoxFillColor = 0xFFF8F8D8,
 	}
 	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor" }
+	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes" }
 
 	------------------------------------------------------------------
 	-- Enemy HP bar geometry for FRLG (from the pokefirered decomp,
@@ -104,9 +107,11 @@ local function EnemyHPRuler()
 	end
 
 	local function loadSavedSettings()
-		local reverse = TrackerAPI.getExtensionSetting(EXT_KEY, "reverseNumbers")
-		if reverse ~= nil then
-			Settings.reverseNumbers = (reverse == true or reverse == "true")
+		for _, key in ipairs(BoolKeys) do
+			local savedValue = TrackerAPI.getExtensionSetting(EXT_KEY, key)
+			if savedValue ~= nil then
+				Settings[key] = (savedValue == true or savedValue == "true")
+			end
 		end
 		for _, key in ipairs(ColorKeys) do
 			local savedValue = tonumber(TrackerAPI.getExtensionSetting(EXT_KEY, key) or "")
@@ -117,7 +122,9 @@ local function EnemyHPRuler()
 	end
 
 	local function saveSettings()
-		TrackerAPI.saveExtensionSetting(EXT_KEY, "reverseNumbers", Settings.reverseNumbers == true)
+		for _, key in ipairs(BoolKeys) do
+			TrackerAPI.saveExtensionSetting(EXT_KEY, key, Settings[key] == true)
+		end
 		for _, key in ipairs(ColorKeys) do
 			TrackerAPI.saveExtensionSetting(EXT_KEY, key, Settings[key])
 		end
@@ -223,11 +230,21 @@ local function EnemyHPRuler()
 	function self.configureOptions()
 		if not Main.IsOnBizhawk() then return end
 		closeOptionsForm()
-		optionsForm = forms.newform(360, 320, "Enemy HP Ruler Options", function() optionsForm = nil end)
+		optionsForm = forms.newform(360, 380, "HP Ruler Options", function() optionsForm = nil end)
 
-		local reverseCheckbox = forms.checkbox(optionsForm, "Reverse numbers: show 75 50 25 (damage dealt)", 12, 10)
-		forms.setproperty(reverseCheckbox, "AutoSize", true)
-		forms.setproperty(reverseCheckbox, "Checked", Settings.reverseNumbers == true)
+		local checkboxRows = {
+			{ key = "showQuarterLabels", label = "Show numbers below the bar" },
+			{ key = "showLabelBoxes", label = "Show boxes behind the numbers" },
+			{ key = "reverseNumbers", label = "Reverse numbers: show 75 50 25 (damage dealt)" },
+		}
+		local checkboxes = {}
+		local rowY = 10
+		for _, row in ipairs(checkboxRows) do
+			checkboxes[row.key] = forms.checkbox(optionsForm, row.label, 12, rowY)
+			forms.setproperty(checkboxes[row.key], "AutoSize", true)
+			forms.setproperty(checkboxes[row.key], "Checked", Settings[row.key] == true)
+			rowY = rowY + 26
+		end
 
 		local colorRows = {
 			{ key = "tickColor", label = "Tick marks above the bar" },
@@ -237,7 +254,7 @@ local function EnemyHPRuler()
 			{ key = "labelBoxFillColor", label = "Number box fill" },
 		}
 		local colorTextboxes = {}
-		local rowY = 45
+		rowY = rowY + 10
 		for _, row in ipairs(colorRows) do
 			forms.label(optionsForm, row.label, 12, rowY + 2, 180, 20)
 			colorTextboxes[row.key] = forms.textbox(optionsForm, colorToHex(Settings[row.key]), 90, 20, nil, 200, rowY)
@@ -247,7 +264,9 @@ local function EnemyHPRuler()
 
 		local buttonY = rowY + 34
 		forms.button(optionsForm, "Save", function()
-			Settings.reverseNumbers = forms.ischecked(reverseCheckbox)
+			for _, row in ipairs(checkboxRows) do
+				Settings[row.key] = forms.ischecked(checkboxes[row.key])
+			end
 			for _, row in ipairs(colorRows) do
 				local parsedColor = parseColorHex(forms.gettext(colorTextboxes[row.key]))
 				if parsedColor ~= nil then
@@ -259,7 +278,9 @@ local function EnemyHPRuler()
 			Program.redraw(true)
 		end, 25, buttonY, 90, 26)
 		forms.button(optionsForm, "Defaults", function()
-			forms.setproperty(reverseCheckbox, "Checked", ConfigurableDefaults.reverseNumbers)
+			for _, row in ipairs(checkboxRows) do
+				forms.setproperty(checkboxes[row.key], "Checked", ConfigurableDefaults[row.key])
+			end
 			for _, row in ipairs(colorRows) do
 				forms.settext(colorTextboxes[row.key], colorToHex(ConfigurableDefaults[row.key]))
 			end
@@ -321,4 +342,4 @@ local function EnemyHPRuler()
 
 	return self
 end
-return EnemyHPRuler
+return IronmonHpRuler
