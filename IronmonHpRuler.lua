@@ -10,7 +10,7 @@
 
 local function IronmonHpRuler()
 	local self = {}
-	self.version = "1.5"
+	self.version = "1.6"
 	self.name = "HP Ruler"
 	self.author = "WaffleSmacker"
 	self.description = "For those of you who can't eyeball the HP like me.  Uhh.. follow WaffleSmacker I guess?"
@@ -32,6 +32,9 @@ local function IronmonHpRuler()
 		showTicks = true,
 		-- Thin vertical lines drawn across the bar fill itself at 25% / 50% / 75%
 		showQuarterLines = true,
+		-- true: the 25/50/75 lines are short ticks below the bar (default)
+		-- false: they cross over the bar fill itself
+		quarterLinesBelowBar = true,
 		-- Small number labels drawn below the bar
 		showQuarterLabels = true,
 		-- Small filled box drawn behind each number for readability
@@ -52,7 +55,7 @@ local function IronmonHpRuler()
 		lastDamageColor = 0xFFFF4040, -- red segment for the most recent damage
 		-- Used instead when the enemy is below 20% HP (their bar fill is red there,
 		-- so a red segment would blend right into it)
-		lastDamageLowHpColor = 0xFF303030,
+		lastDamageLowHpColor = 0xFF3060F8, -- blue
 		-- If the ruler ever looks misaligned, nudge it here (in game pixels)
 		nudgeX = 0,
 		nudgeY = 0,
@@ -69,16 +72,17 @@ local function IronmonHpRuler()
 		showQuarterLabels = true,
 		showLabelBoxes = true,
 		showLastDamage = false,
+		quarterLinesBelowBar = true,
 		tickColor = 0xFF000000,
 		quarterLineColor = 0x98000000,
 		labelColor = 0xFF000000,
 		labelBoxBorderColor = 0xFF000000,
 		labelBoxFillColor = 0xFFF8F8D8,
 		lastDamageColor = 0xFFFF4040,
-		lastDamageLowHpColor = 0xFF303030,
+		lastDamageLowHpColor = 0xFF3060F8,
 	}
 	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor", "lastDamageColor", "lastDamageLowHpColor" }
-	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes", "showLastDamage" }
+	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes", "showLastDamage", "quarterLinesBelowBar" }
 
 	------------------------------------------------------------------
 	-- Enemy HP bar geometry for FRLG (from the pokefirered decomp,
@@ -288,7 +292,12 @@ local function IronmonHpRuler()
 		if Settings.showQuarterLines then
 			for _, fraction in ipairs({ 0.25, 0.50, 0.75 }) do
 				local x = barX + math.floor(BAR_WIDTH * fraction + 0.5)
-				gui.drawLine(x, barY, x, barY + BAR_HEIGHT - 1, Settings.quarterLineColor)
+				if Settings.quarterLinesBelowBar then
+					-- short tick hanging below the bar, mirroring the ticks on top
+					gui.drawLine(x, barY + BAR_HEIGHT + 1, x, barY + BAR_HEIGHT + 2, Settings.quarterLineColor)
+				else
+					gui.drawLine(x, barY, x, barY + BAR_HEIGHT - 1, Settings.quarterLineColor)
+				end
 			end
 		end
 		if Settings.showQuarterLabels then
@@ -327,13 +336,14 @@ local function IronmonHpRuler()
 	function self.configureOptions()
 		if not Main.IsOnBizhawk() then return end
 		closeOptionsForm()
-		optionsForm = forms.newform(360, 440, "HP Ruler Options", function() optionsForm = nil end)
+		optionsForm = forms.newform(360, 470, "HP Ruler Options", function() optionsForm = nil end)
 
 		local checkboxRows = {
 			{ key = "showQuarterLabels", label = "Show numbers below the bar" },
 			{ key = "showLabelBoxes", label = "Show boxes behind the numbers" },
 			{ key = "reverseNumbers", label = "Reverse numbers: show 75 50 25 (damage dealt)" },
 			{ key = "showLastDamage", label = "Paint the last damage taken red on the bar" },
+			{ key = "quarterLinesBelowBar", label = "Draw the 25/50/75 lines below the bar, not across it" },
 		}
 		local checkboxes = {}
 		local rowY = 10
