@@ -10,7 +10,7 @@
 
 local function IronmonHpRuler()
 	local self = {}
-	self.version = "1.61"
+	self.version = "1.62"
 	self.name = "HP Ruler"
 	self.author = "WaffleSmacker"
 	self.description = "For those of you who can't eyeball the HP like me.  Uhh.. follow WaffleSmacker I guess?"
@@ -45,6 +45,19 @@ local function IronmonHpRuler()
 		-- Paint the most recent chunk of damage on the bar in red (off by default).
 		-- Clears when the enemy's HP next changes, they switch out, or the battle ends.
 		showLastDamage = false,
+		-- Tall line crossing the bar at 25%, shown only in trainer battles (off by
+		-- default). The game's AI (ShouldUseItem in the decomp) uses its healing
+		-- items when its mon's HP drops BELOW 1/4 of max, so leaving an enemy
+		-- anywhere left of this line risks a Full Restore.
+		showAiHealLine = false,
+		-- Marks on the bar fill predicting where the enemy's HP will land after
+		-- each of the next few end-of-turn chip hits (off by default).
+		-- Models poison (1/8), Toxic (escalating n/16, using the real counter
+		-- from memory), burn (1/8), and Curse (1/4) - all statuses the game
+		-- already shows on screen. Later turns are drawn more transparent.
+		showChipMarks = false,
+		-- How many future turns of chip damage to mark
+		chipForecastTurns = 3,
 		-- Colors are 0xAARRGGBB (AA = opacity, FF = solid)
 		tickColor = 0xFF000000, -- solid black
 		quarterLineColor = 0x98000000, -- semi-transparent black
@@ -56,6 +69,8 @@ local function IronmonHpRuler()
 		-- Used instead when the enemy is below 20% HP (their bar fill is red there,
 		-- so a red segment would blend right into it)
 		lastDamageLowHpColor = 0xFF82CAFF, -- light blue
+		aiHealLineColor = 0xFFFF3399, -- pink, like the healing item animation
+		chipMarkColor = 0xFFA040E0, -- poison purple
 		-- If the ruler ever looks misaligned, nudge it here (in game pixels)
 		nudgeX = 0,
 		nudgeY = 0,
@@ -73,6 +88,8 @@ local function IronmonHpRuler()
 		showLabelBoxes = true,
 		showLastDamage = false,
 		quarterLinesBelowBar = true,
+		showAiHealLine = false,
+		showChipMarks = false,
 		tickColor = 0xFF000000,
 		quarterLineColor = 0x98000000,
 		labelColor = 0xFF000000,
@@ -80,9 +97,11 @@ local function IronmonHpRuler()
 		labelBoxFillColor = 0xFFF8F8D8,
 		lastDamageColor = 0xFFFF4040,
 		lastDamageLowHpColor = 0xFF82CAFF,
+		aiHealLineColor = 0xFFFF3399,
+		chipMarkColor = 0xFFA040E0,
 	}
-	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor", "lastDamageColor", "lastDamageLowHpColor" }
-	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes", "showLastDamage", "quarterLinesBelowBar" }
+	local ColorKeys = { "tickColor", "quarterLineColor", "labelColor", "labelBoxBorderColor", "labelBoxFillColor", "lastDamageColor", "lastDamageLowHpColor", "aiHealLineColor", "chipMarkColor" }
+	local BoolKeys = { "reverseNumbers", "showQuarterLabels", "showLabelBoxes", "showLastDamage", "quarterLinesBelowBar", "showAiHealLine", "showChipMarks" }
 
 	------------------------------------------------------------------
 	-- Enemy HP bar geometry for FRLG (from the pokefirered decomp,
@@ -188,8 +207,11 @@ local function IronmonHpRuler()
 	local BATTLER_INDEX = { LeftOther = 1, RightOther = 3 }
 	local BATTLEMON_HP_OFFSET = 0x28
 	local BATTLEMON_MAXHP_OFFSET = 0x2C
+	local BATTLEMON_STATUS1_OFFSET = 0x4C -- sleep/poison/burn/toxic + toxic counter
+	local BATTLEMON_STATUS2_OFFSET = 0x50 -- volatile statuses (curse, etc.)
 
-	-- Returns curHP, maxHP for the enemy in that battle slot, or nil if no valid mon is out
+	-- Returns curHP, maxHP, status1, status2 for the enemy in that battle slot,
+	-- or nil if no valid mon is out
 	local function readEnemyBattleHP(slotKey)
 		local baseAddress = GameSettings.gBattleMons or 0
 		if baseAddress == 0 then return nil end
@@ -197,7 +219,56 @@ local function IronmonHpRuler()
 		local species = Memory.readword(monAddress)
 		local maxHP = Memory.readword(monAddress + BATTLEMON_MAXHP_OFFSET)
 		if species == 0 or maxHP == 0 then return nil end
-		return Memory.readword(monAddress + BATTLEMON_HP_OFFSET), maxHP
+		return Memory.readword(monAddress + BATTLEMON_HP_OFFSET), maxHP,
+			Memory.readdword(monAddress + BATTLEMON_STATUS1_OFFSET),
+			Memory.readdword(monAddress + BATTLEMON_STATUS2_OFFSET)
+	end
+
+	-- Single-bit flag test without the bit library (keeps older Lua versions happy)
+	local function hasFlag(value, flag)
+		return math.floor(value / flag) % 2 == 1
+	end
+
+	-- Predicts the enemy's HP fraction after each of the next few end-of-turn
+	-- chip hits, matching the game's math exactly (each source is floor'd with a
+	-- minimum of 1 damage). Returns a list of fractions (clamped at 0, stopping
+	-- once they'd faint), or nil if they have no chip status.
+	-- Leech Seed and weather chip live outside gBattleMons, so they're not modeled.
+	local STATUS1_POISON = 0x08
+	local STATUS1_BURN = 0x10
+	local STATUS1_TOXIC = 0x80
+	local STATUS2_CURSED = 0x10000000
+	local function computeChipForecast(curHP, maxHP, status1, status2)
+		if not Settings.showChipMarks then return nil end
+		if curHP == nil or curHP <= 0 or status1 == nil then return nil end
+		local isPoison = hasFlag(status1, STATUS1_POISON)
+		local isBurn = hasFlag(status1, STATUS1_BURN)
+		local isToxic = hasFlag(status1, STATUS1_TOXIC)
+		local isCursed = hasFlag(status2, STATUS2_CURSED)
+		if not (isPoison or isBurn or isToxic or isCursed) then return nil end
+		local toxicCounter = math.floor(status1 / 0x100) % 16 -- turns of toxic taken so far
+		local fractions = {}
+		local hp = curHP
+		for turn = 1, Settings.chipForecastTurns do
+			local damage = 0
+			if isPoison then
+				damage = damage + math.max(1, math.floor(maxHP / 8))
+			end
+			if isToxic then
+				-- The counter increments (capping at 15) before damage each turn
+				damage = damage + math.max(1, math.floor(maxHP / 16)) * math.min(toxicCounter + turn, 15)
+			end
+			if isBurn then
+				damage = damage + math.max(1, math.floor(maxHP / 8))
+			end
+			if isCursed then
+				damage = damage + math.max(1, math.floor(maxHP / 4))
+			end
+			hp = hp - damage
+			table.insert(fractions, math.max(0, hp / maxHP))
+			if hp <= 0 then break end -- they faint here; no further marks
+		end
+		return fractions
 	end
 
 	------------------------------------------------------------------
@@ -275,7 +346,7 @@ local function IronmonHpRuler()
 	------------------------------------------------------------------
 	-- Drawing
 	------------------------------------------------------------------
-	local function drawRuler(barX, barY, slotKey)
+	local function drawRuler(barX, barY, slotKey, chipFractions)
 		barX = barX + Settings.nudgeX
 		barY = barY + Settings.nudgeY
 		-- Red segment for the most recent damage, drawn first so ruler marks stay on top
@@ -310,6 +381,23 @@ local function IronmonHpRuler()
 					gui.drawLine(x, barY, x, barY + BAR_HEIGHT - 1, Settings.quarterLineColor)
 				end
 			end
+		end
+		if Settings.showChipMarks and chipFractions ~= nil then
+			-- One mark per future turn at where the fill edge will be; later
+			-- turns fade out so the sequence reads left-to-right in time
+			local alpha = math.floor(Settings.chipMarkColor / 0x1000000) % 256
+			local rgb = Settings.chipMarkColor % 0x1000000
+			for turnIndex, fraction in ipairs(chipFractions) do
+				local x = barX + math.floor(BAR_WIDTH * fraction + 0.5)
+				local fadedAlpha = math.floor(alpha * (Settings.chipForecastTurns + 1 - turnIndex) / Settings.chipForecastTurns)
+				gui.drawLine(x, barY, x, barY + BAR_HEIGHT - 1, fadedAlpha * 0x1000000 + rgb)
+			end
+		end
+		if Settings.showAiHealLine and not Battle.isWildEncounter then
+			-- Tall line crossing the whole bar at 25%: the AI heals once its
+			-- mon's HP is BELOW this, so finish them from the right of the line
+			local x = barX + math.floor(BAR_WIDTH * 0.25 + 0.5)
+			gui.drawLine(x, barY - 5, x, barY + BAR_HEIGHT + 2, Settings.aiHealLineColor)
 		end
 		if Settings.showQuarterLabels then
 			for _, fraction in ipairs({ 0.25, 0.50, 0.75 }) do
@@ -347,7 +435,7 @@ local function IronmonHpRuler()
 	function self.configureOptions()
 		if not Main.IsOnBizhawk() then return end
 		closeOptionsForm()
-		optionsForm = forms.newform(360, 470, "HP Ruler Options", function() optionsForm = nil end)
+		optionsForm = forms.newform(360, 580, "HP Ruler Options", function() optionsForm = nil end)
 
 		local checkboxRows = {
 			{ key = "showQuarterLabels", label = "Show numbers below the bar" },
@@ -355,6 +443,8 @@ local function IronmonHpRuler()
 			{ key = "reverseNumbers", label = "Reverse numbers: show 75 50 25 (damage dealt)" },
 			{ key = "showLastDamage", label = "Paint the last damage taken red on the bar" },
 			{ key = "quarterLinesBelowBar", label = "Draw the 25/50/75 lines below the bar, not across it" },
+			{ key = "showAiHealLine", label = "Mark 25%, below which trainers use healing items" },
+			{ key = "showChipMarks", label = "Forecast poison/burn chip damage on the bar" },
 		}
 		local checkboxes = {}
 		local rowY = 10
@@ -373,6 +463,8 @@ local function IronmonHpRuler()
 			{ key = "labelBoxFillColor", label = "Number box fill" },
 			{ key = "lastDamageColor", label = "Last damage segment" },
 			{ key = "lastDamageLowHpColor", label = "Last damage (enemy hp in red)" },
+			{ key = "aiHealLineColor", label = "Trainer heal line (25%)" },
+			{ key = "chipMarkColor", label = "Chip damage forecast marks" },
 		}
 		local colorTextboxes = {}
 		rowY = rowY + 10
@@ -456,11 +548,11 @@ local function IronmonHpRuler()
 
 		local positions = (Battle.numBattlers == 4) and BarPositions.doubles or BarPositions.singles
 		for _, pos in ipairs(positions) do
-			local curHP, maxHP = readEnemyBattleHP(pos.slotKey)
+			local curHP, maxHP, status1, status2 = readEnemyBattleHP(pos.slotKey)
 			local delayElapsed = slotDelayElapsed(pos.slotKey) -- also detects switch-ins; call before damage tracking
 			updateDamageState(pos.slotKey, curHP, maxHP)
 			if delayElapsed and curHP ~= nil and curHP > 0 then
-				drawRuler(pos.x, pos.y, pos.slotKey)
+				drawRuler(pos.x, pos.y, pos.slotKey, computeChipForecast(curHP, maxHP, status1, status2))
 			end
 		end
 	end
