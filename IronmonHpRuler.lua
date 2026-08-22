@@ -10,7 +10,7 @@
 
 local function IronmonHpRuler()
 	local self = {}
-	self.version = "1.62"
+	self.version = "1.63"
 	self.name = "HP Ruler"
 	self.author = "WaffleSmacker"
 	self.description = "For those of you who can't eyeball the HP like me.  Uhh.. follow WaffleSmacker I guess?"
@@ -201,6 +201,28 @@ local function IronmonHpRuler()
 		return BATTLE_MAIN_CB2[callback2] == true
 	end
 
+	-- The battle is over the moment you run, win, lose, or catch: gBattleOutcome
+	-- flips right then, ahead of the "Got away safely!" text and the fade out, and
+	-- keeps that value until the next battle starts. Hiding on it also covers the
+	-- post-battle stretch (evolutions, move learning) where the Tracker still
+	-- reports an active battle.
+	local function isBattleDecided()
+		local outcomeAddress = GameSettings.gBattleOutcome or 0
+		if outcomeAddress == 0 then return false end
+		return Memory.readbyte(outcomeAddress) ~= 0
+	end
+
+	-- True while a level-up move is being learned: the "Delete a move to make room
+	-- for X?" prompt and the summary screen for picking the move to forget.
+	-- Same battle script range the Tracker itself uses to spot a move being learned.
+	local function isLearningNewMove()
+		local scriptStart = GameSettings.BattleScript_LearnMoveLoop or 0
+		local scriptEnd = GameSettings.BattleScript_LearnMoveReturn or 0
+		if scriptStart == 0 or scriptEnd == 0 then return false end
+		local battleMsg = Memory.readdword(GameSettings.gBattlescriptCurrInstr)
+		return scriptStart <= battleMsg and battleMsg < scriptEnd
+	end
+
 	-- Live in-battle HP comes from the game's gBattleMons battle structs (the
 	-- party structs don't reliably sync mid-battle in gen 3).
 	-- Battler order: 0 = player left, 1 = enemy left, 2 = player right, 3 = enemy right
@@ -342,6 +364,35 @@ local function IronmonHpRuler()
 		end
 		return currentFrame >= showAt
 	end
+
+	-- Every reason to hide the ruler that isn't specific to one enemy slot
+	local function rulerAllowedOnScreen()
+		if GameSettings.versiongroup ~= 2 then return false end -- FireRed/LeafGreen only
+		if not Battle.inActiveBattle() then return false end
+		if Program.currentOverlay ~= nil then return false end -- e.g. log viewer is open
+		if not isBattleScreenShowing() then return false end -- e.g. in-battle bag or party menu is open
+		if isBattleDecided() then return false end -- ran away / won / lost / caught
+		if isLearningNewMove() then return false end
+		return true
+	end
+
+	-- Whether any slot's ruler should be on screen right now. Side-effect free, so
+	-- it can be asked every frame; the drawing pass does the same checks itself.
+	local function anyRulerVisible()
+		if not rulerAllowedOnScreen() then return false end
+		local currentFrame = emu.framecount()
+		local positions = (Battle.numBattlers == 4) and BarPositions.doubles or BarPositions.singles
+		for _, pos in ipairs(positions) do
+			local curHP = readEnemyBattleHP(pos.slotKey)
+			if curHP ~= nil and curHP > 0 and currentFrame >= (showAtFrame[pos.slotKey] or 0) then
+				return true
+			end
+		end
+		return false
+	end
+
+	-- True while at least one ruler is sitting on the Bizhawk canvas
+	local rulerIsOnScreen = false
 
 	------------------------------------------------------------------
 	-- Drawing
@@ -534,6 +585,7 @@ local function IronmonHpRuler()
 	-- Executed once every 30 frames or after any redraw event is scheduled
 	function self.afterRedraw()
 		if not Main.IsOnBizhawk() then return end -- drawing overlays requires Bizhawk
+		rulerIsOnScreen = false
 		if GameSettings.versiongroup ~= 2 then return end -- FireRed/LeafGreen only
 
 		local inBattle = Battle.inActiveBattle()
@@ -542,9 +594,7 @@ local function IronmonHpRuler()
 		end
 		wasInActiveBattle = inBattle
 
-		if not inBattle then return end
-		if Program.currentOverlay ~= nil then return end -- e.g. log viewer is open
-		if not isBattleScreenShowing() then return end -- e.g. in-battle bag or party menu is open
+		if not rulerAllowedOnScreen() then return end
 
 		local positions = (Battle.numBattlers == 4) and BarPositions.doubles or BarPositions.singles
 		for _, pos in ipairs(positions) do
@@ -553,8 +603,21 @@ local function IronmonHpRuler()
 			updateDamageState(pos.slotKey, curHP, maxHP)
 			if delayElapsed and curHP ~= nil and curHP > 0 then
 				drawRuler(pos.x, pos.y, pos.slotKey, computeChipForecast(curHP, maxHP, status1, status2))
+				rulerIsOnScreen = true
 			end
 		end
+	end
+
+	-- The Tracker only repaints its canvas about twice a second, and Bizhawk leaves
+	-- the previous drawing up until then, so a ruler that should already be gone can
+	-- sit there for up to half a second. Watch every frame instead and force the
+	-- repaint the moment the ruler should come down.
+	function self.afterEachFrame()
+		if not Main.IsOnBizhawk() then return end
+		if not rulerIsOnScreen then return end
+		if anyRulerVisible() then return end
+		rulerIsOnScreen = false
+		Program.redraw(true)
 	end
 
 	return self
